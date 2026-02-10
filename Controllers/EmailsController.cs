@@ -3,6 +3,7 @@ using MailArchiver.Data;
 using MailArchiver.Models;
 using MailArchiver.Models.ViewModels;
 using MailArchiver.Services;
+using MailArchiver.Services.Providers;
 using MailArchiver.ViewModels;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.Rendering;
@@ -19,7 +20,8 @@ namespace MailArchiver.Controllers
     public class EmailsController : Controller
     {
         private readonly MailArchiverDbContext _context;
-        private readonly IEmailService _emailService;
+        private readonly MailArchiver.Services.Core.EmailCoreService _emailCoreService;
+        private readonly MailArchiver.Services.Factories.ProviderEmailServiceFactory _providerFactory;
         private readonly IGraphEmailService _graphEmailService;
         private readonly ILogger<EmailsController> _logger;
         private readonly IBatchRestoreService? _batchRestoreService;
@@ -33,14 +35,17 @@ namespace MailArchiver.Controllers
         private readonly IServiceScopeFactory _serviceScopeFactory;
         private readonly MailArchiver.Services.IAuthenticationService _authService;
         private readonly IEmailDeletionService? _emailDeletionService;
+        private readonly ViewOptions _viewOptions;
 
         public EmailsController(
             MailArchiverDbContext context,
-            IEmailService emailService,
+            MailArchiver.Services.Core.EmailCoreService emailCoreService,
+            MailArchiver.Services.Factories.ProviderEmailServiceFactory providerFactory,
             IGraphEmailService graphEmailService,
             ILogger<EmailsController> logger,
             IOptions<BatchRestoreOptions> batchOptions,
             IOptions<SelectionOptions> selectionOptions,
+            IOptions<ViewOptions> viewOptions,
             IBatchRestoreService? batchRestoreService = null,
             ISyncJobService? syncJobService = null,
             IStringLocalizer<SharedResource> localizer = null,
@@ -53,13 +58,15 @@ namespace MailArchiver.Controllers
 
         {
             _context = context;
-            _emailService = emailService;
+            _emailCoreService = emailCoreService;
+            _providerFactory = providerFactory;
             _graphEmailService = graphEmailService;
             _logger = logger;
             _batchRestoreService = batchRestoreService;
             _syncJobService = syncJobService;
             _batchOptions = batchOptions.Value;
             _selectionOptions = selectionOptions.Value;
+            _viewOptions = viewOptions.Value;
             _localizer = localizer;
             _exportService = exportService;
             _selectedEmailsExportService = selectedEmailsExportService;
@@ -195,7 +202,7 @@ namespace MailArchiver.Controllers
             int? accountIdForSearch = model.SelectedAccountId;
             
             // Suche durchführen
-            var (emails, totalCount) = await _emailService.SearchEmailsAsync(
+            var (emails, totalCount) = await _emailCoreService.SearchEmailsAsync(
                 model.SearchTerm,
                 model.FromDate,
                 model.ToDate,
@@ -299,14 +306,23 @@ namespace MailArchiver.Controllers
             var htmlBodyToDisplay = !string.IsNullOrEmpty(email.BodyUntruncatedHtml) 
                 ? email.BodyUntruncatedHtml 
                 : email.HtmlBody;
+            
+            var textBodyToDisplay = !string.IsNullOrEmpty(email.BodyUntruncatedText) 
+                ? email.BodyUntruncatedText 
+                : email.Body;
 
             var model = new EmailDetailViewModel
             {
                 Email = email,
                 AccountName = email.MailAccount?.Name ?? "Unknown account",
                 FormattedHtmlBody = !string.IsNullOrEmpty(htmlBodyToDisplay) 
-                    ? ResolveInlineImagesInHtml(SanitizeHtml(htmlBodyToDisplay), email.Attachments) 
+                    ? ResolveInlineImagesInHtml(SanitizeHtml(htmlBodyToDisplay, _viewOptions.BlockExternalResources), email.Attachments) 
                     : string.Empty,
+                PlainTextBody = textBodyToDisplay ?? string.Empty,
+                DefaultToPlainText = _viewOptions.DefaultToPlainText,
+                BlockExternalResources = _viewOptions.BlockExternalResources,
+                HasHtmlBody = !string.IsNullOrEmpty(htmlBodyToDisplay),
+                HasPlainTextBody = !string.IsNullOrEmpty(textBodyToDisplay),
             };
 
             // Store return URL in ViewBag
@@ -540,7 +556,7 @@ namespace MailArchiver.Controllers
                     EmailId = id
                 };
 
-                var fileBytes = await _emailService.ExportEmailsAsync(exportParams, allowedAccountIds);
+                var fileBytes = await _emailCoreService.ExportEmailsAsync(exportParams, allowedAccountIds);
 
                 string contentType;
                 string fileName;
@@ -693,7 +709,8 @@ namespace MailArchiver.Controllers
                 }
                 else
                 {
-                    folders = await _emailService.GetMailFoldersAsync(model.TargetAccountId);
+                    var provider = await _providerFactory.GetServiceForAccountAsync(model.TargetAccountId);
+                    folders = await provider.GetMailFoldersAsync(model.TargetAccountId);
                 }
                 
                 model.AvailableFolders = folders.Select(f => new SelectListItem
@@ -788,7 +805,8 @@ namespace MailArchiver.Controllers
                     }
                     else
                     {
-                        folders = await _emailService.GetMailFoldersAsync(model.TargetAccountId);
+                        var provider = await _providerFactory.GetServiceForAccountAsync(model.TargetAccountId);
+                        folders = await provider.GetMailFoldersAsync(model.TargetAccountId);
                     }
                     
                     model.AvailableFolders = folders.Select(f => new SelectListItem
@@ -839,7 +857,8 @@ namespace MailArchiver.Controllers
                 }
                 else
                 {
-                    result = await _emailService.RestoreEmailToFolderAsync(
+                    var restoreProvider = await _providerFactory.GetServiceForAccountAsync(model.TargetAccountId);
+                    result = await restoreProvider.RestoreEmailToFolderAsync(
                         model.EmailId,
                         model.TargetAccountId,
                         model.TargetFolder);
@@ -1063,7 +1082,8 @@ namespace MailArchiver.Controllers
                 }
                 else
                 {
-                    folders = await _emailService.GetMailFoldersAsync(model.TargetAccountId);
+                    var provider = await _providerFactory.GetServiceForAccountAsync(model.TargetAccountId);
+                    folders = await provider.GetMailFoldersAsync(model.TargetAccountId);
                 }
                 
                 model.AvailableFolders = folders.Select(f => new SelectListItem
@@ -1155,7 +1175,8 @@ namespace MailArchiver.Controllers
                     }
                     else
                     {
-                        folders = await _emailService.GetMailFoldersAsync(model.TargetAccountId);
+                        var provider = await _providerFactory.GetServiceForAccountAsync(model.TargetAccountId);
+                        folders = await provider.GetMailFoldersAsync(model.TargetAccountId);
                     }
                     
                     model.AvailableFolders = folders.Select(f => new SelectListItem
@@ -1231,7 +1252,8 @@ namespace MailArchiver.Controllers
                 }
                 else
                 {
-                    var result = await _emailService.RestoreMultipleEmailsWithProgressAsync(
+                    var batchProvider = await _providerFactory.GetServiceForAccountAsync(model.TargetAccountId);
+                    var result = await batchProvider.RestoreMultipleEmailsWithProgressAsync(
                         model.SelectedEmailIds,
                         model.TargetAccountId,
                         model.TargetFolder,
@@ -1457,7 +1479,8 @@ namespace MailArchiver.Controllers
             if (model.AvailableAccounts.Count == 1)
             {
                 model.TargetAccountId = int.Parse(model.AvailableAccounts[0].Value);
-                var folders = await _emailService.GetMailFoldersAsync(model.TargetAccountId);
+                var provider = await _providerFactory.GetServiceForAccountAsync(model.TargetAccountId);
+                var folders = await provider.GetMailFoldersAsync(model.TargetAccountId);
                 model.AvailableFolders = folders.Select(f => new SelectListItem
                 {
                     Value = f,
@@ -1539,7 +1562,8 @@ namespace MailArchiver.Controllers
 
                 if (model.TargetAccountId > 0)
                 {
-                    var folders = await _emailService.GetMailFoldersAsync(model.TargetAccountId);
+                    var provider = await _providerFactory.GetServiceForAccountAsync(model.TargetAccountId);
+                    var folders = await provider.GetMailFoldersAsync(model.TargetAccountId);
                     model.AvailableFolders = folders.Select(f => new SelectListItem
                     {
                         Value = f,
@@ -1994,7 +2018,7 @@ namespace MailArchiver.Controllers
                 else if (targetAccount.Provider == ProviderType.IMAP)
                 {
                     _logger.LogInformation("Using Email service to get folders for IMAP account {AccountId}", accountId);
-                    folders = await _emailService.GetMailFoldersAsync(accountId);
+                    var tmpProvider = await _providerFactory.GetServiceForAccountAsync(accountId); folders = await tmpProvider.GetMailFoldersAsync(accountId);
                 }
                 else
                 {
@@ -2081,7 +2105,7 @@ namespace MailArchiver.Controllers
                 // For single email export, we don't need to filter by accounts
                 if (model.EmailId.HasValue)
                 {
-                    var fileBytes = await _emailService.ExportEmailsAsync(model, allowedAccountIds);
+                    var fileBytes = await _emailCoreService.ExportEmailsAsync(model, allowedAccountIds);
                     
                     string contentType;
                     string fileName;
@@ -2111,7 +2135,7 @@ namespace MailArchiver.Controllers
                 else
                 {
                     // For search results export, we need to ensure proper filtering
-                    var fileBytes = await _emailService.ExportEmailsAsync(model, allowedAccountIds);
+                    var fileBytes = await _emailCoreService.ExportEmailsAsync(model, allowedAccountIds);
 
                     string contentType;
                     string fileName;
@@ -2145,7 +2169,7 @@ namespace MailArchiver.Controllers
 
         // GET: Emails/RawContent/5
         [EmailAccessRequired]
-        public async Task<IActionResult> RawContent(int id)
+        public async Task<IActionResult> RawContent(int id, bool plainText = false)
         {
             var email = await _context.ArchivedEmails
                 .Include(e => e.Attachments)
@@ -2166,29 +2190,58 @@ namespace MailArchiver.Controllers
                 ? email.BodyUntruncatedText 
                 : email.Body;
 
-            // Bereiten Sie das HTML für die direkte Anzeige vor
-            string html = !string.IsNullOrEmpty(htmlBodyToDisplay)
-                ? ResolveInlineImagesInHtml(SanitizeHtml(htmlBodyToDisplay), email.Attachments)
-                : $"<pre>{HttpUtility.HtmlEncode(textBodyToDisplay)}</pre>";
+            string html;
 
-            // Fügen Sie die Basis-HTML-Struktur hinzu, wenn sie fehlt
-            if (!html.Contains("<!DOCTYPE") && !html.Contains("<html"))
+            // If plain text is requested or if there's no HTML body
+            if (plainText || string.IsNullOrEmpty(htmlBodyToDisplay))
             {
+                // Display plain text
                 html = $@"<!DOCTYPE html>
                 <html>
                 <head>
                     <meta charset=""utf-8"">
                     <meta name=""viewport"" content=""width=device-width, initial-scale=1.0"">
-                    <base target=""_blank"">
                     <style>
-                        body {{ font-family: Arial, sans-serif; margin: 15px; }}
-                        pre {{ white-space: pre-wrap; }}
+                        body {{ font-family: Arial, sans-serif; margin: 15px; background-color: #f8f9fa; }}
+                        pre {{ 
+                            white-space: pre-wrap; 
+                            word-wrap: break-word;
+                            background-color: white;
+                            padding: 20px;
+                            border: 1px solid #dee2e6;
+                            border-radius: 4px;
+                        }}
                     </style>
                 </head>
                 <body>
-                    {html}
+                    <pre>{HttpUtility.HtmlEncode(textBodyToDisplay ?? "[No content available]")}</pre>
                 </body>
                 </html>";
+            }
+            else
+            {
+                // Display HTML with external resource blocking if configured
+                html = ResolveInlineImagesInHtml(SanitizeHtml(htmlBodyToDisplay, _viewOptions.BlockExternalResources), email.Attachments);
+
+                // Fügen Sie die Basis-HTML-Struktur hinzu, wenn sie fehlt
+                if (!html.Contains("<!DOCTYPE") && !html.Contains("<html"))
+                {
+                    html = $@"<!DOCTYPE html>
+                    <html>
+                    <head>
+                        <meta charset=""utf-8"">
+                        <meta name=""viewport"" content=""width=device-width, initial-scale=1.0"">
+                        <base target=""_blank"">
+                        <style>
+                            body {{ font-family: Arial, sans-serif; margin: 15px; }}
+                            pre {{ white-space: pre-wrap; }}
+                        </style>
+                    </head>
+                    <body>
+                        {html}
+                    </body>
+                    </html>";
+                }
             }
 
             // Set proper content type with UTF-8 encoding to ensure correct character display
@@ -2196,7 +2249,7 @@ namespace MailArchiver.Controllers
         }
 
         // Hilfsmethode zur Bereinigung von HTML für die sichere Darstellung
-        private string SanitizeHtml(string html)
+        private string SanitizeHtml(string html, bool blockExternalResources = false)
         {
             if (string.IsNullOrEmpty(html))
                 return string.Empty;
@@ -2209,6 +2262,40 @@ namespace MailArchiver.Controllers
 
             // Entfernen von javascript: URLs
             html = Regex.Replace(html, @"href=([""'])javascript:.*?\1", "href=\"#\"", RegexOptions.IgnoreCase);
+
+            // Block external resources if configured
+            if (blockExternalResources)
+            {
+                // Block external images (except data: URIs and cid: references for inline images)
+                html = Regex.Replace(html, 
+                    @"<img\s+([^>]*\s+)?src\s*=\s*([""'])(?!data:|cid:)https?://[^""']+\2", 
+                    "<img $1src=$2$2", 
+                    RegexOptions.IgnoreCase);
+                
+                // Block external stylesheets
+                html = Regex.Replace(html, 
+                    @"<link\s+([^>]*\s+)?href\s*=\s*([""'])https?://[^""']+\2[^>]*>", 
+                    "", 
+                    RegexOptions.IgnoreCase);
+                
+                // Block external CSS imports in style tags
+                html = Regex.Replace(html, 
+                    @"@import\s+url\s*\(\s*[""']?https?://[^)]+\)?", 
+                    "", 
+                    RegexOptions.IgnoreCase);
+                
+                // Block external fonts
+                html = Regex.Replace(html, 
+                    @"@font-face\s*\{[^}]*url\s*\(\s*[""']?https?://[^)]+\)[^}]*\}", 
+                    "", 
+                    RegexOptions.IgnoreCase);
+                
+                // Block external background images in inline styles (but keep data: URIs)
+                html = Regex.Replace(html, 
+                    @"(style\s*=\s*[""'][^""']*)(background(?:-image)?\s*:\s*url\s*\(\s*[""']?)(?!data:)https?://[^)]+\)", 
+                    "$1none)", 
+                    RegexOptions.IgnoreCase);
+            }
 
             // WICHTIG: Style-Tags und inline-style Attribute NICHT entfernen
             // Dadurch bleibt das originale Styling der E-Mail erhalten

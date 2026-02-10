@@ -13,13 +13,15 @@ using Microsoft.Graph.Models.ODataErrors;
 using Microsoft.Kiota.Abstractions.Authentication;
 using Microsoft.Kiota.Http.HttpClientLibrary;
 using Microsoft.Kiota.Abstractions;
+using Azure.Identity;
 
-namespace MailArchiver.Services
+
+namespace MailArchiver.Services.Providers
 {
     /// <summary>
     /// Service for Microsoft Graph email operations for M365 accounts
     /// </summary>
-    public class GraphEmailService : IGraphEmailService
+    public class GraphEmailService : IGraphEmailService, IProviderEmailService
     {
         private readonly MailArchiverDbContext _context;
         private readonly ILogger<GraphEmailService> _logger;
@@ -27,6 +29,7 @@ namespace MailArchiver.Services
         private readonly BatchOperationOptions _batchOptions;
         private readonly MailSyncOptions _mailSyncOptions;
         private readonly DateTimeHelper _dateTimeHelper;
+        private readonly MailArchiver.Services.Core.EmailCoreService _coreService;
 
         public GraphEmailService(
             MailArchiverDbContext context,
@@ -34,7 +37,8 @@ namespace MailArchiver.Services
             ISyncJobService syncJobService,
             IOptions<BatchOperationOptions> batchOptions,
             IOptions<MailSyncOptions> mailSyncOptions,
-            DateTimeHelper dateTimeHelper)
+            DateTimeHelper dateTimeHelper,
+            MailArchiver.Services.Core.EmailCoreService coreService)
         {
             _context = context;
             _logger = logger;
@@ -42,89 +46,45 @@ namespace MailArchiver.Services
             _batchOptions = batchOptions.Value;
             _mailSyncOptions = mailSyncOptions.Value;
             _dateTimeHelper = dateTimeHelper;
+            _coreService = coreService;
         }
 
-        /// <summary>
-        /// Creates a GraphServiceClient for the specified M365 account using client credentials flow
-        /// </summary>
-        /// <param name="account">The M365 mail account</param>
-        /// <returns>Configured GraphServiceClient</returns>
-        private async Task<GraphServiceClient> CreateGraphClientAsync(MailAccount account)
-        {
-            if (string.IsNullOrEmpty(account.ClientId) || string.IsNullOrEmpty(account.ClientSecret))
-            {
-                throw new InvalidOperationException($"M365 account '{account.Name}' requires ClientId and ClientSecret for OAuth authentication");
-            }
+/// <summary>
+/// Creates a GraphServiceClient for the specified M365 account using client credentials flow
+/// with automatic token refresh via Azure.Identity.
+/// </summary>
+///         /// <param name="account">The M365 mail account</param>
+/// <returns>Configured GraphServiceClient</returns>
+private async Task<GraphServiceClient> CreateGraphClientAsync(MailAccount account)
+{
+    if (string.IsNullOrEmpty(account.ClientId) || string.IsNullOrEmpty(account.ClientSecret))
+    {
+         throw new InvalidOperationException($"M365 account '{account.Name}' requires ClientId and ClientSecret for OAuth authentication");
+    }
 
-            var accessToken = await GetAccessTokenAsync(account);
+    var tenantId = !string.IsNullOrEmpty(account.TenantId) ? account.TenantId : "common";
 
-            // Create GraphServiceClient with the access token using a custom auth provider
-            var authProvider = new TokenAuthenticationProvider(accessToken);
-            var requestAdapter = new HttpClientRequestAdapter(authProvider);
-            var graphServiceClient = new GraphServiceClient(requestAdapter);
+    // Azure.Identity handles token acquisition + refresh automatically
+    var credential = new ClientSecretCredential(
+        tenantId: tenantId,
+        clientId: account.ClientId,
+        clientSecret: account.ClientSecret);
 
-            return graphServiceClient;
-        }
+    // Use .default for app permissions
+    var graphServiceClient = new GraphServiceClient(
+        credential,
+        new[] { "https://graph.microsoft.com/.default" });
 
-        /// <summary>
-        /// Gets an OAuth access token for Microsoft Graph API
-        /// </summary>
-        /// <param name="account">The M365 mail account</param>
-        /// <returns>Access token string</returns>
-        private async Task<string> GetAccessTokenAsync(MailAccount account)
-        {
-            try
-            {
-                string tenantId = !string.IsNullOrEmpty(account.TenantId) ? account.TenantId : "common";
+    return graphServiceClient;
+}
 
-                _logger.LogDebug("Getting Graph API access token for M365 account: {AccountName} with tenant: {TenantId}", account.Name, tenantId);
 
-                var tokenEndpoint = $"https://login.microsoftonline.com/{tenantId}/oauth2/v2.0/token";
+       
 
-                var requestBody = new FormUrlEncodedContent(new[]
-                {
-                    new KeyValuePair<string, string>("client_id", account.ClientId),
-                    new KeyValuePair<string, string>("client_secret", account.ClientSecret),
-                    new KeyValuePair<string, string>("scope", "https://graph.microsoft.com/.default"),
-                    new KeyValuePair<string, string>("grant_type", "client_credentials")
-                });
 
-                using var httpClient = new HttpClient();
-                httpClient.Timeout = TimeSpan.FromSeconds(60);
 
-                var response = await httpClient.PostAsync(tokenEndpoint, requestBody);
-                var responseContent = await response.Content.ReadAsStringAsync();
 
-                if (!response.IsSuccessStatusCode)
-                {
-                    _logger.LogError("Failed to get Graph API access token for M365 account {AccountName}. Status: {StatusCode}, Response: {Response}",
-                        account.Name, response.StatusCode, responseContent);
-                    throw new InvalidOperationException($"Failed to get Graph API access token: {response.StatusCode} - {responseContent}");
-                }
 
-                var tokenResponse = JsonSerializer.Deserialize<JsonElement>(responseContent);
-
-                if (!tokenResponse.TryGetProperty("access_token", out var accessTokenElement))
-                {
-                    throw new InvalidOperationException("Graph API OAuth response does not contain access_token");
-                }
-
-                var accessToken = accessTokenElement.GetString();
-
-                if (string.IsNullOrEmpty(accessToken))
-                {
-                    throw new InvalidOperationException("Received empty access token from Microsoft Graph API");
-                }
-
-                _logger.LogDebug("Successfully obtained Graph API access token for M365 account: {AccountName}", account.Name);
-                return accessToken;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error getting Graph API access token for M365 account {AccountName}: {Message}", account.Name, ex.Message);
-                throw;
-            }
-        }
 
         public async Task SyncMailAccountAsync(MailAccount account, string? jobId = null)
         {
@@ -223,8 +183,13 @@ namespace MailArchiver.Services
                 // Update lastSync only if no individual email failed
                 if (failedEmails == 0)
                 {
-                    account.LastSync = DateTime.UtcNow;
-                    await _context.SaveChangesAsync();
+                    // Update LastSync using a separate tracked entity to avoid tracking conflicts
+                    var trackedAccount = await _context.MailAccounts.FindAsync(account.Id);
+                    if (trackedAccount != null)
+                    {
+                        trackedAccount.LastSync = DateTime.UtcNow;
+                        await _context.SaveChangesAsync();
+                    }
                 }
                 else
                 {
@@ -2493,24 +2458,86 @@ namespace MailArchiver.Services
                 _logger.LogError(ex, "Failed to save original text content as attachment for email {EmailId}", archivedEmailId);
             }
         }
-    }
 
-    /// <summary>
-    /// Simple token authentication provider for Microsoft Graph
-    /// </summary>
-    public class TokenAuthenticationProvider : IAuthenticationProvider
-    {
-        private readonly string _accessToken;
+        #region IProviderEmailService Implementation - Wrapper Methods
 
-        public TokenAuthenticationProvider(string accessToken)
+        // IProviderEmailService requires method signatures with IDs instead of objects
+        // These wrapper methods adapt between the interfaces
+
+        Task<List<string>> MailArchiver.Services.Providers.IProviderEmailService.GetMailFoldersAsync(int accountId)
         {
-            _accessToken = accessToken;
+            var account = _context.MailAccounts.FindAsync(accountId).GetAwaiter().GetResult();
+            if (account == null)
+                return Task.FromResult(new List<string>());
+            
+            return GetMailFoldersAsync(account);
         }
 
-        public Task AuthenticateRequestAsync(RequestInformation request, Dictionary<string, object>? additionalAuthenticationContext = null, CancellationToken cancellationToken = default)
+        async Task<bool> MailArchiver.Services.Providers.IProviderEmailService.RestoreEmailToFolderAsync(
+            int emailId, int targetAccountId, string folderName)
         {
-            request.Headers.Add("Authorization", $"Bearer {_accessToken}");
-            return Task.CompletedTask;
+            var email = await _context.ArchivedEmails
+                .Include(e => e.Attachments)
+                .FirstOrDefaultAsync(e => e.Id == emailId);
+            
+            if (email == null)
+                return false;
+            
+            var targetAccount = await _context.MailAccounts.FindAsync(targetAccountId);
+            if (targetAccount == null)
+                return false;
+            
+            return await RestoreEmailToFolderAsync(email, targetAccount, folderName);
         }
+
+        Task<(int Successful, int Failed)> MailArchiver.Services.Providers.IProviderEmailService.RestoreMultipleEmailsWithProgressAsync(
+            List<int> emailIds,
+            int targetAccountId,
+            string folderName,
+            Action<int, int, int> progressCallback,
+            CancellationToken cancellationToken = default)
+        {
+            // Graph API restore - not yet optimized for bulk operations
+            throw new NotImplementedException("Bulk restore with progress not yet implemented for Graph API provider");
+        }
+
+        async Task<bool> MailArchiver.Services.Providers.IProviderEmailService.ResyncAccountAsync(int accountId)
+        {
+            try
+            {
+                // First, update LastSync in the database using a tracked entity
+                var account = await _context.MailAccounts.FindAsync(accountId);
+                if (account == null)
+                    return false;
+                
+                account.LastSync = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+                await _context.SaveChangesAsync();
+                
+                // Now fetch the account again for the sync operation to avoid tracking conflicts
+                var accountForSync = await _context.MailAccounts.AsNoTracking().FirstOrDefaultAsync(a => a.Id == accountId);
+                if (accountForSync == null)
+                {
+                    _logger.LogError("Account with ID {AccountId} not found after update", accountId);
+                    return false;
+                }
+                
+                var jobId = _syncJobService.StartSync(accountForSync.Id, accountForSync.Name, accountForSync.LastSync);
+                await SyncMailAccountAsync(accountForSync, jobId);
+                
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error during resync for Graph API account {AccountId}", accountId);
+                return false;
+            }
+        }
+
+        Task<int> MailArchiver.Services.Providers.IProviderEmailService.GetEmailCountByAccountAsync(int accountId)
+        {
+            return _coreService.GetEmailCountByAccountAsync(accountId);
+        }
+
+        #endregion
     }
 }

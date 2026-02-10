@@ -1,7 +1,8 @@
 using MailArchiver.Data;
 using MailArchiver.Models;
-using MailArchiver.Services;
+using MailArchiver.Services.Providers;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Options;
 
 namespace MailArchiver.Services
 {
@@ -36,30 +37,42 @@ namespace MailArchiver.Services
                 {
                     using var scope = _serviceProvider.CreateScope();
                     var dbContext = scope.ServiceProvider.GetRequiredService<MailArchiverDbContext>();
-                    var emailService = scope.ServiceProvider.GetRequiredService<IEmailService>();
+                    var providerFactory = scope.ServiceProvider.GetRequiredService<MailArchiver.Services.Factories.ProviderEmailServiceFactory>();
                     var graphEmailService = scope.ServiceProvider.GetRequiredService<IGraphEmailService>();
                     var syncJobService = scope.ServiceProvider.GetRequiredService<ISyncJobService>();
 
-                    var accounts = await dbContext.MailAccounts
+                    // First load accounts to check if AlwaysForceFullSync needs to update LastSync
+                    var accountsForSync = await dbContext.MailAccounts
                         .Where(a => a.IsEnabled && a.Provider != ProviderType.IMPORT)
                         .ToListAsync(stoppingToken);
 
-                    _logger.LogInformation($"Found {accounts.Count} enabled accounts to sync");
+                    _logger.LogInformation($"Found {accountsForSync.Count} enabled accounts to sync");
 
                     // If AlwaysForceFullSync is enabled, reset LastSync for all accounts to force full resync
                     if (alwaysForceFullSync)
                     {
                         _logger.LogInformation("AlwaysForceFullSync is enabled. Forcing full resync for all accounts.");
-                        foreach (var account in accounts)
+                        foreach (var account in accountsForSync)
                         {
                             account.LastSync = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
                         }
                         await dbContext.SaveChangesAsync();
+                        
+                        // After saving, clear the change tracker and reload accounts as untracked
+                        // to avoid tracking conflicts in the sync methods
+                        dbContext.ChangeTracker.Clear();
                     }
                     else
                     { 
                         _logger.LogInformation("AlwaysForceFullSync is disabled. Using quick sync for all accounts.");
                     }
+
+                    // Load accounts as untracked to prevent EF tracking conflicts
+                    // The sync methods will create their own tracked entities when needed
+                    var accounts = await dbContext.MailAccounts
+                        .AsNoTracking()
+                        .Where(a => a.IsEnabled && a.Provider != ProviderType.IMPORT)
+                        .ToListAsync(stoppingToken);
 
                     foreach (var account in accounts)
                     {
@@ -96,7 +109,8 @@ namespace MailArchiver.Services
                             else
                             {
                                 _logger.LogInformation("Using IMAP for account: {AccountName}", account.Name);
-                                await emailService.SyncMailAccountAsync(account, jobId);
+                                var provider = await providerFactory.GetServiceForAccountAsync(account.Id);
+                                await provider.SyncMailAccountAsync(account, jobId);
                             }
                             
                             _logger.LogInformation("Mail sync completed for account: {AccountName}", account.Name);
